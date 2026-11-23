@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InmoBaja | Plataforma Web de Bienes Raíces</title>
+
+  <!-- Google Fonts: Plus Jakarta Sans -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- Leaflet CSS (Mapa interactivo) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+
+  <!-- Hoja de estilos propia -->
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- =========================================================
+       VISTA 1: AUTENTICACIÓN (INICIO DE SESIÓN / REGISTRO)
+  ========================================================== -->
+  <section id="authView" class="auth-wrapper">
+    <div class="auth-card">
+      <!-- Panel izquierdo informativo -->
+      <div class="auth-brand">
+        <div class="brand-badge">UABC FIAD • Aplicaciones Web</div>
+        <div class="brand-logo">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1v-9.5z"/>
+          </svg>
+          <span>InmoBaja</span>
+        </div>
+        <h1>Encuentra o vende tu propiedad en Baja California</h1>
+        <p>
+          Conecta directamente con compradores y vendedores sin intermediarios ni pagos dentro de la plataforma. Explora propiedades en mapa interactivo y agenda citas presenciales de forma segura.
+        </p>
+
+        <ul class="brand-features">
+          <li>✓ Catálogo con filtros avanzados y favoritos</li>
+          <li>✓ Mapa interactivo con escuelas, hospitales y supermercados</li>
+          <li>✓ Chat interno directo entre comprador y vendedor</li>
+          <li>✓ Gestión de anuncios, estadísticas y moderación</li>
+        </ul>
+
+        <!-- Accesos rápidos de demostración -->
+        <div class="demo-box">
+          <span class="demo-title">Acceso rápido de prueba (1 clic):</span>
+          <div class="demo-buttons">
+            <button type="button" class="btn-demo" data-demo-role="comprador">Entrar como Comprador</button>
+            <button type="button" class="btn-demo" data-demo-role="vendedor">Entrar como Vendedor</button>
+            <button type="button" class="btn-demo" data-demo-role="admin">Entrar como Admin</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Panel derecho formularios -->
+      <div class="auth-forms">
+        <div class="auth-tabs">
+          <button type="button" id="tabLogin" class="auth-tab active">Iniciar Sesión</button>
+          <button type="button" id="tabRegister" class="auth-tab">Registrarse</button>
+        </div>
+
+        <!-- Formulario Login -->
+        <form id="loginForm" class="form-panel active" novalidate>
+          <h2>Bienvenido de nuevo</h2>
+          <p class="form-subtitle">Ingresa tus credenciales para acceder a la plataforma.</p>
+
+          <div class="form-group">
+            <label for="loginEmail">Correo electrónico</label>
+            <input type="email" id="loginEmail" placeholder="ejemplo@uabc.edu.mx" required />
+          </div>
+
+          <div class="form-group">
+            <label for="loginPassword">Contraseña</label>
+            <input type="password" id="loginPassword" placeholder="••••••••" required />
+          </div>
+
+          <p id="loginError" class="form-error" aria-live="polite"></p>
+
+          <button type="submit" class="btn btn-primary btn-full">Entrar a la plataforma</button>
+        </form>
+
+        <!-- Formulario Registro -->
+        <form id="registerForm" class="form-panel" novalidate>
+          <h2>Crear cuenta nueva</h2>
+          <p class="form-subtitle">Selecciona el perfil con el que deseas participar.</p>
+
+          <div class="role-selector">
+            <label class="role-option">
+              <input type="radio" name="registerRole" value="comprador" checked />
+              <div class="role-card">
+                <strong>Soy Comprador</strong>
+                <span>Busco casas, terrenos o locales</span>
+              </div>
+            </label>
+            <label class="role-option">
+              <input type="radio" name="registerRole" value="vendedor" />
+              <div class="role-card">
+                <strong>Soy Vendedor</strong>
+                <span>Quiero publicar mis propiedades</span>
+              </div>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label for="regName">Nombre completo</label>
+            <input type="text" id="regName" placeholder="Ej. Israel Ledesma Alcalá" required />
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="regEmail">Correo electrónico</label>
+              <input type="email" id="regEmail" placeholder="correo@ejemplo.com" required />
+            </div>
+            <div class="form-group">
+              <label for="regPhone">Teléfono</label>
+              <input type="tel" id="regPhone" placeholder="646 123 4567" required />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="regPassword">Contraseña (mínimo 6 caracteres)</label>
+            <input type="password" id="regPassword" placeholder="Crea una contraseña segura" required />
+          </div>
+
+          <p id="registerError" class="form-error" aria-live="polite"></p>
+
+          <button type="submit" class="btn btn-primary btn-full">Registrarme ahora</button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       VISTA 2: PLATAFORMA PRINCIPAL (APLICACIÓN WEB)
+  ========================================================== -->
+  <div id="appView" class="app-shell hidden">
+    <!-- Barra de navegación superior -->
+    <header class="navbar">
+      <div class="navbar-left">
+        <div class="nav-brand">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1v-9.5z"/>
+          </svg>
+          <span>InmoBaja</span>
+        </div>
+
+        <nav class="nav-links" id="mainNav">
+          <button type="button" class="nav-btn active" data-section="exploreSection">Explorar Propiedades</button>
+          <button type="button" class="nav-btn" data-section="favoritesSection" id="navFavoritesBtn">
+            Favoritos <span class="badge-pill" id="favCountBadge">0</span>
+          </button>
+          <button type="button" class="nav-btn hidden" data-section="sellerSection" id="navSellerBtn">
+            Mis Publicaciones
+          </button>
+          <button type="button" class="nav-btn hidden" data-section="adminSection" id="navAdminBtn">
+            Panel Admin <span class="badge-pill badge-danger" id="reportCountBadge">0</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="navbar-right">
+        <button type="button" class="btn btn-outline btn-sm" id="openMessagesBtn">
+          💬 Mensajes <span class="badge-pill" id="msgCountBadge">0</span>
+        </button>
+
+        <div class="user-chip">
+          <div class="user-avatar" id="userAvatar">U</div>
+          <div class="user-meta">
+            <span id="userNameDisplay" class="user-name">Usuario</span>
+            <span id="userRoleBadge" class="role-tag">Comprador</span>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-ghost btn-sm" id="logoutBtn" title="Cerrar sesión">Salir</button>
+      </div>
+    </header>
+
+    <!-- Contenido principal -->
+    <main class="main-container">
+
+      <!-- SECCIÓN A: EXPLORAR CATÁLOGO Y MAPA INTERACTIVO -->
+      <section id="exploreSection" class="content-section active">
+        <div class="section-header">
+          <div>
+            <h2>Catálogo de Bienes Raíces</h2>
+            <p>Filtra por precio, ubicación, tamaño o tipo de propiedad, y revisa los servicios cercanos en el mapa.</p>
+          </div>
+          <div class="view-toggle">
+            <button type="button" class="toggle-btn active" id="viewSplitBtn">Vista Dividida</button>
+            <button type="button" class="toggle-btn" id="viewGridBtn">Solo Catálogo</button>
+            <button type="button" class="toggle-btn" id="viewMapBtn">Solo Mapa</button>
+          </div>
+        </div>
+
+        <!-- Barra de filtros -->
+        <div class="filters-bar">
+          <div class="filter-item">
+            <label for="filterZone">Ubicación / Zona</label>
+            <select id="filterZone">
+              <option value="todas">Todas las zonas</option>
+              <option value="El Sauzal">El Sauzal</option>
+              <option value="Playitas">Playitas</option>
+              <option value="Chapultepec">Chapultepec</option>
+              <option value="Valle de Guadalupe">Valle de Guadalupe</option>
+              <option value="Zona Centro">Zona Centro</option>
+            </select>
+          </div>
+
+          <div class="filter-item">
+            <label for="filterType">Tipo de propiedad</label>
+            <select id="filterType">
+              <option value="todos">Todos los tipos</option>
+              <option value="Casa">Casa</option>
+              <option value="Terreno">Terreno</option>
+              <option value="Departamento">Departamento</option>
+              <option value="Local Comercial">Local Comercial</option>
+            </select>
+          </div>
+
+          <div class="filter-item">
+            <label for="filterMaxPrice">Precio máximo (MXN)</label>
+            <input type="number" id="filterMaxPrice" placeholder="Ej. 4500000" min="0" step="100000" />
+          </div>
+
+          <div class="filter-item">
+            <label for="filterMinSize">Tamaño mínimo (m²)</label>
+            <input type="number" id="filterMinSize" placeholder="Ej. 150" min="0" step="10" />
+          </div>
+
+          <div class="filter-actions">
+            <button type="button" class="btn btn-secondary" id="resetFiltersBtn">Limpiar filtros</button>
+          </div>
+        </div>
+
+        <!-- Layout dividido: Catálogo + Mapa -->
+        <div class="explore-layout" id="exploreLayout">
+          <div class="catalog-column" id="catalogColumn">
+            <div class="results-bar">
+              <span id="resultsCounter">Mostrando 0 propiedades</span>
+            </div>
+            <div class="properties-grid" id="propertiesGrid"></div>
+          </div>
+
+          <div class="map-column" id="mapColumn">
+            <div class="map-card">
+              <div class="map-toolbar">
+                <strong>Mapa Interactivo y Servicios Cercanos</strong>
+                <div class="poi-toggles">
+                  <label><input type="checkbox" id="toggleSchools" checked /> 🎓 Escuelas</label>
+                  <label><input type="checkbox" id="toggleHospitals" checked /> 🏥 Hospitales</label>
+                  <label><input type="checkbox" id="toggleMarkets" checked /> 🛒 Supermercados</label>
+                </div>
+              </div>
+              <div id="propertyMap"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECCIÓN B: PROPIEDADES FAVORITAS -->
+      <section id="favoritesSection" class="content-section">
+        <div class="section-header">
+          <div>
+            <h2>Mis Propiedades Favoritas</h2>
+            <p>Propiedades guardadas para comparar ubicaciones y contactar a los vendedores.</p>
+          </div>
+        </div>
+        <div class="properties-grid" id="favoritesGrid"></div>
+      </section>
+
+      <!-- SECCIÓN C: PANEL DEL VENDEDOR -->
+      <section id="sellerSection" class="content-section">
+        <div class="section-header">
+          <div>
+            <h2>Panel de Gestión del Vendedor</h2>
+            <p>Publica nuevos inmuebles, administra su estado (activa/pausada) y consulta tus estadísticas.</p>
+          </div>
+          <button type="button" class="btn btn-primary" id="openNewPropertyModalBtn">+ Publicar Propiedad</button>
+        </div>
+
+        <!-- Tarjetas de estadísticas -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">Publicaciones Totales</span>
+            <strong class="stat-value" id="statTotalProps">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Visitas Recibidas</span>
+            <strong class="stat-value" id="statTotalViews">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Guardadas en Favoritos</span>
+            <strong class="stat-value" id="statTotalFavs">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Conversaciones Activas</span>
+            <strong class="stat-value" id="statTotalChats">0</strong>
+          </div>
+        </div>
+
+        <!-- Tabla de gestión del vendedor -->
+        <div class="table-card">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Propiedad</th>
+                <th>Zona / Tipo</th>
+                <th>Precio (MXN)</th>
+                <th>Visitas</th>
+                <th>Estado</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="sellerPropertiesTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- SECCIÓN D: PANEL DE ADMINISTRACIÓN -->
+      <section id="adminSection" class="content-section">
+        <div class="section-header">
+          <div>
+            <h2>Panel de Administración y Moderación</h2>
+            <p>Supervisa los reportes de anuncios falsos o inapropiados, publicaciones y usuarios registrados.</p>
+          </div>
+        </div>
+
+        <div class="admin-grid">
+          <!-- Reportes -->
+          <div class="table-card">
+            <div class="card-title-bar">
+              <h3>Reportes de Anuncios</h3>
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Propiedad Reportada</th>
+                  <th>Motivo</th>
+                  <th>Reportado por</th>
+                  <th>Estado</th>
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="adminReportsTable"></tbody>
+            </table>
+          </div>
+
+          <!-- Usuarios -->
+          <div class="table-card">
+            <div class="card-title-bar">
+              <h3>Usuarios Registrados</h3>
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Nombre</th>
+                  <th>Correo</th>
+                  <th>Rol</th>
+                  <th>Estado</th>
+                  <th>Acción</th>
+                </tr>
+              </thead>
+              <tbody id="adminUsersTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- =========================================================
+       MODAL 1: DETALLE DE PROPIEDAD Y CONTACTO
+  ========================================================== -->
+  <div id="propertyDetailModal" class="modal-backdrop hidden">
+    <div class="modal-box modal-lg">
+      <button type="button" class="modal-close" data-close-modal="propertyDetailModal">&times;</button>
+      <div id="propertyDetailContent"></div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL 2: CREAR / EDITAR PROPIEDAD (VENDEDOR)
+  ========================================================== -->
+  <div id="propertyFormModal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <button type="button" class="modal-close" data-close-modal="propertyFormModal">&times;</button>
+      <h3 id="propertyFormTitle">Publicar Nueva Propiedad</h3>
+      <form id="propertyForm" novalidate>
+        <input type="hidden" id="propId" />
+
+        <div class="form-group">
+          <label for="propTitle">Título del anuncio</label>
+          <input type="text" id="propTitle" placeholder="Ej. Casa moderna frente al mar en El Sauzal" required />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="propType">Tipo de propiedad</label>
+            <select id="propType" required>
+              <option value="Casa">Casa</option>
+              <option value="Terreno">Terreno</option>
+              <option value="Departamento">Departamento</option>
+              <option value="Local Comercial">Local Comercial</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="propZone">Zona / Localidad</label>
+            <select id="propZone" required>
+              <option value="El Sauzal">El Sauzal</option>
+              <option value="Playitas">Playitas</option>
+              <option value="Chapultepec">Chapultepec</option>
+              <option value="Valle de Guadalupe">Valle de Guadalupe</option>
+              <option value="Zona Centro">Zona Centro</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="propPrice">Precio (MXN)</label>
+            <input type="number" id="propPrice" placeholder="3500000" min="10000" required />
+          </div>
+          <div class="form-group">
+            <label for="propSize">Superficie (m²)</label>
+            <input type="number" id="propSize" placeholder="220" min="10" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="propBeds">Recámaras (0 si es terreno)</label>
+            <input type="number" id="propBeds" value="3" min="0" required />
+          </div>
+          <div class="form-group">
+            <label for="propBaths">Baños</label>
+            <input type="number" id="propBaths" value="2" min="0" required />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="propAddress">Dirección o referencia</label>
+          <input type="text" id="propAddress" placeholder="Ej. Blvd. Teniente Azueta #450, Ensenada" required />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="propLat">Latitud (Mapa)</label>
+            <input type="number" id="propLat" step="any" value="31.8667" required />
+          </div>
+          <div class="form-group">
+            <label for="propLng">Longitud (Mapa)</label>
+            <input type="number" id="propLng" step="any" value="-116.6667" required />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="propImageFile">Fotografía de la propiedad (subir archivo o usar URL)</label>
+          <input type="file" id="propImageFile" accept="image/*" />
+          <input type="url" id="propImageUrl" placeholder="O pega una URL de imagen (https://...)" style="margin-top: 8px;" />
+        </div>
+
+        <div class="form-group">
+          <label for="propDesc">Descripción detallada</label>
+          <textarea id="propDesc" rows="3" placeholder="Describe características, servicios cercanos y estado legal..." required></textarea>
+        </div>
+
+        <p id="propFormError" class="form-error"></p>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close-modal="propertyFormModal">Cancelar</button>
+          <button type="submit" class="btn btn-primary">Guardar Publicación</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       MODAL 3: REPORTAR ANUNCIO
+  ========================================================== -->
+  <div id="reportModal" class="modal-backdrop hidden">
+    <div class="modal-box modal-sm">
+      <button type="button" class="modal-close" data-close-modal="reportModal">&times;</button>
+      <h3>Denunciar Publicación</h3>
+      <p class="form-subtitle">Ayúdanos a mantener la plataforma libre de fraudes o información falsa.</p>
+      <form id="reportForm">
+        <input type="hidden" id="reportPropId" />
+        <div class="form-group">
+          <label for="reportReason">Motivo del reporte</label>
+          <select id="reportReason" required>
+            <option value="Información o precio falso">Información o precio falso</option>
+            <option value="Posible fraude / suplantación">Posible fraude / suplantación</option>
+            <option value="Fotografías no corresponden al inmueble">Fotografías no corresponden al inmueble</option>
+            <option value="Contenido inapropiado o duplicado">Contenido inapropiado o duplicado</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="reportDetails">Detalles adicionales</label>
+          <textarea id="reportDetails" rows="3" placeholder="Explica brevemente el problema..." required></textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" data-close-modal="reportModal">Cancelar</button>
+          <button type="submit" class="btn btn-danger">Enviar Reporte</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       CAJÓN LATERAL: CHAT INTERNO COMPRADOR - VENDEDOR
+  ========================================================== -->
+  <aside id="chatDrawer" class="chat-drawer hidden">
+    <div class="chat-header">
+      <div>
+        <strong>Mensajes Internos</strong>
+        <small>Coordina citas presenciales • Sin pagos en línea</small>
+      </div>
+      <button type="button" class="modal-close" id="closeChatDrawerBtn">&times;</button>
+    </div>
+
+    <div class="chat-body">
+      <div class="chat-threads" id="chatThreadsList"></div>
+      <div class="chat-conversation">
+        <div class="chat-conv-header" id="activeChatHeader">Selecciona una conversación</div>
+        <div class="chat-messages" id="chatMessagesContainer">
+          <p class="empty-hint">Selecciona un chat o inicia uno desde el detalle de una propiedad.</p>
+        </div>
+        <form id="chatSendForm" class="chat-input-bar hidden">
+          <input type="text" id="chatMessageInput" placeholder="Escribe un mensaje para agendar cita..." required />
+          <button type="submit" class="btn btn-primary btn-sm">Enviar</button>
+        </form>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Notificación flotante (Toast) -->
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- Lógica de aplicación (Backend simulado + Frontend) -->
+  <script src="app.js"></script>
+</body>
+</html>
