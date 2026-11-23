@@ -1,22 +1,52 @@
 /* ==========================================================================
    PLATAFORMA WEB DE BIENES RAÍCES - INMOBAJA (UABC FIAD)
-   Backend simulado en JavaScript (Persistencia localStorage, Auth con Hash SHA-256,
-   CRUD de Propiedades, Favoritos, Mapa Leaflet con POIs, Chat Interno y Moderación)
+   Backend simulado en JavaScript con validaciones de entrada, prevención de
+   doble envío, persistencia en localStorage, borradores ante recarga, manejo
+   de fallos de red/imágenes externas, mapa Leaflet y moderación.
 ========================================================================== */
 
 (function () {
   'use strict';
 
-  // Claves de almacenamiento local
   const STORAGE_KEYS = {
     USERS: 'inmobaja_users_v1',
     PROPERTIES: 'inmobaja_properties_v1',
     MESSAGES: 'inmobaja_messages_v1',
     REPORTS: 'inmobaja_reports_v1',
-    SESSION: 'inmobaja_session_v1'
+    SESSION: 'inmobaja_session_v1',
+    DRAFTS: 'inmobaja_drafts_v1'
   };
 
-  // Servicios importantes en Ensenada (Escuelas, Hospitales, Supermercados)
+  // Límites máximos de longitud (evita textos de 200+ letras desbordando UI/datos)
+  const LIMITS = {
+    NAME_MAX: 80,
+    EMAIL_MAX: 120,
+    PHONE_MAX: 25,
+    PASSWORD_MIN: 6,
+    PASSWORD_MAX: 100,
+    PROP_TITLE_MAX: 100,
+    PROP_ADDRESS_MAX: 140,
+    PROP_DESC_MAX: 1000,
+    REPORT_DETAILS_MAX: 600,
+    CHAT_MSG_MAX: 600,
+    MAX_PRICE: 500000000,
+    MAX_SIZE: 1000000,
+    MAX_ROOMS: 100
+  };
+
+  // Imagen de respaldo local (SVG Data URI) si falla la red o la URL externa
+  const FALLBACK_IMAGE =
+    'data:image/svg+xml;charset=UTF-8,' +
+    encodeURIComponent(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500">
+        <rect width="800" height="500" fill="#e2e8f0"/>
+        <path d="M400 135L230 275v125h115v-85h110v85h115V275L400 135z" fill="#0f4c81"/>
+        <text x="400" y="445" font-family="sans-serif" font-size="22" font-weight="bold" fill="#334155" text-anchor="middle">
+          Imagen no disponible sin conexión
+        </text>
+      </svg>
+    `);
+
   const NEARBY_SERVICES = [
     { name: 'UABC Campus Ensenada (FIAD)', category: 'school', lat: 31.8656, lng: -116.6669 },
     { name: 'CICESE Ensenada', category: 'school', lat: 31.8685, lng: -116.6631 },
@@ -28,15 +58,16 @@
     { name: 'Soriana Híper Reforma', category: 'market', lat: 31.8389, lng: -116.6025 }
   ];
 
-  // Estado en memoria
   let currentUser = null;
   let activeChatThreadId = null;
   let mapInstance = null;
   let propertyMarkersLayer = null;
   let poiMarkersLayer = null;
+  let hasUnsavedFormWork = false;
+  const busyLocks = new Set();
 
   /* ========================================================================
-     1. UTILIDADES DE SEGURIDAD (CIFRADO SHA-256) Y FORMATEO
+     1. UTILIDADES DE SEGURIDAD, FORMATO Y VALIDACIÓN
   ======================================================================== */
   async function hashPassword(plainText) {
     if (window.crypto && window.crypto.subtle) {
@@ -46,21 +77,21 @@
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
     }
-    // Respaldo simple en entornos sin contexto seguro
     return btoa(unescape(encodeURIComponent(plainText)));
   }
 
   function formatCurrency(amount) {
+    const safeNum = Number.isFinite(Number(amount)) ? Number(amount) : 0;
     return new Intl.NumberFormat('es-MX', {
       style: 'currency',
       currency: 'MXN',
       maximumFractionDigits: 0
-    }).format(amount);
+    }).format(safeNum);
   }
 
   function sanitize(str) {
     const div = document.createElement('div');
-    div.textContent = str;
+    div.textContent = String(str ?? '');
     return div.innerHTML;
   }
 
@@ -71,26 +102,114 @@
     clearTimeout(toast._timer);
     toast._timer = setTimeout(() => {
       toast.classList.add('hidden');
-    }, 3200);
+    }, 3400);
+  }
+
+  // Valida números estrictamente (rechaza texto, NaN, Infinity, vacíos o fuera de rango)
+  function parseStrictNumber(rawValue, { min = 0, max = Infinity, allowZero = true, label = 'campo numérico' } = {}) {
+    const str = String(rawValue ?? '').trim();
+    if (str === '') {
+      return { ok: false, error: `El campo "${label}" es obligatorio y debe ser un número.` };
+    }
+    // Evita que "123abc" pase con parseFloat
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(str)) {
+      return { ok: false, error: `"${label}" solo acepta valores numéricos válidos (no texto).` };
+    }
+    const num = Number(str);
+    if (!Number.isFinite(num)) {
+      return { ok: false, error: `"${label}" no es un número válido.` };
+    }
+    if (allowZero ? num < min : num <= min) {
+      return {
+        ok: false,
+        error: allowZero
+          ? `"${label}" no puede ser menor que ${min}.`
+          : `"${label}" debe ser mayor que ${min}.`
+      };
+    }
+    if (num > max) {
+      return { ok: false, error: `"${label}" no puede exceder ${max.toLocaleString('es-MX')}.` };
+    }
+    return { ok: true, value: num };
+  }
+
+  function validateTextField(rawValue, { label, minLen = 1, maxLen, required = true }) {
+    const clean = String(rawValue ?? '').trim();
+    if (required && clean.length === 0) {
+      return { ok: false, error: `El campo "${label}" no puede estar vacío.` };
+    }
+    if (clean.length > 0 && clean.length < minLen) {
+      return { ok: false, error: `"${label}" debe tener al menos ${minLen} caracteres.` };
+    }
+    if (typeof maxLen === 'number' && clean.length > maxLen) {
+      return {
+        ok: false,
+        error: `"${label}" supera el máximo permitido de ${maxLen} caracteres (actual: ${clean.length}).`
+      };
+    }
+    return { ok: true, value: clean };
+  }
+
+  function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
+  }
+
+  function isSafeHttpUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    } catch {
+      return false;
+    }
+  }
+
+  // Bloquea doble clic / envíos simultáneos en cualquier acción asíncrona o de formulario
+  async function runWithSubmitLock(lockKey, submitBtn, taskFn) {
+    if (busyLocks.has(lockKey)) {
+      return;
+    }
+    busyLocks.add(lockKey);
+    const prevText = submitBtn ? submitBtn.textContent : '';
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Procesando...';
+    }
+    try {
+      await taskFn();
+    } finally {
+      busyLocks.delete(lockKey);
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = prevText;
+      }
+    }
   }
 
   /* ========================================================================
      2. CAPA DE DATOS (SEED INICIAL + CRUD EN LOCALSTORAGE)
   ======================================================================== */
-  function readStore(key) {
+  function readStore(key, fallback = []) {
     try {
-      return JSON.parse(localStorage.getItem(key)) || [];
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      return JSON.parse(raw);
     } catch {
-      return [];
+      return fallback;
     }
   }
 
   function writeStore(key, value) {
-    localStorage.setItem(key, JSON.stringify(value));
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch {
+      showToast('No se pudo guardar en almacenamiento local (espacio lleno o bloqueado).');
+      return false;
+    }
   }
 
   async function seedDatabaseIfEmpty() {
-    if (readStore(STORAGE_KEYS.USERS).length === 0) {
+    if (readStore(STORAGE_KEYS.USERS, []).length === 0) {
       const defaultPass = await hashPassword('123456');
       const users = [
         {
@@ -127,7 +246,7 @@
       writeStore(STORAGE_KEYS.USERS, users);
     }
 
-    if (readStore(STORAGE_KEYS.PROPERTIES).length === 0) {
+    if (readStore(STORAGE_KEYS.PROPERTIES, []).length === 0) {
       const properties = [
         {
           id: 'prop_1',
@@ -228,7 +347,7 @@
       writeStore(STORAGE_KEYS.PROPERTIES, properties);
     }
 
-    if (readStore(STORAGE_KEYS.MESSAGES).length === 0) {
+    if (readStore(STORAGE_KEYS.MESSAGES, []).length === 0) {
       const threads = [
         {
           id: 'chat_prop_1_usr_comprador',
@@ -257,7 +376,7 @@
       writeStore(STORAGE_KEYS.MESSAGES, threads);
     }
 
-    if (readStore(STORAGE_KEYS.REPORTS).length === 0) {
+    if (readStore(STORAGE_KEYS.REPORTS, []).length === 0) {
       const reports = [
         {
           id: 'rep_1',
@@ -274,7 +393,91 @@
   }
 
   /* ========================================================================
-     3. AUTENTICACIÓN Y GESTIÓN DE SESIÓN
+     3. BORRADORES ANTE RECARGA DE PÁGINA Y AVISO DE CAMBIOS SIN GUARDAR
+  ======================================================================== */
+  function saveDraft(draftKey, data) {
+    const drafts = readStore(STORAGE_KEYS.DRAFTS, {});
+    drafts[draftKey] = { data, updatedAt: Date.now() };
+    writeStore(STORAGE_KEYS.DRAFTS, drafts);
+  }
+
+  function loadDraft(draftKey) {
+    const drafts = readStore(STORAGE_KEYS.DRAFTS, {});
+    return drafts[draftKey] ? drafts[draftKey].data : null;
+  }
+
+  function clearDraft(draftKey) {
+    const drafts = readStore(STORAGE_KEYS.DRAFTS, {});
+    delete drafts[draftKey];
+    writeStore(STORAGE_KEYS.DRAFTS, drafts);
+  }
+
+  function setupDraftAndReloadProtection() {
+    // Restaurar borrador de propiedad si hubo recarga a mitad de publicación
+    const propDraft = loadDraft('propertyForm');
+    if (propDraft) {
+      if (propDraft.title) document.getElementById('propTitle').value = propDraft.title;
+      if (propDraft.type) document.getElementById('propType').value = propDraft.type;
+      if (propDraft.zone) document.getElementById('propZone').value = propDraft.zone;
+      if (propDraft.price) document.getElementById('propPrice').value = propDraft.price;
+      if (propDraft.size) document.getElementById('propSize').value = propDraft.size;
+      if (propDraft.beds !== undefined) document.getElementById('propBeds').value = propDraft.beds;
+      if (propDraft.baths !== undefined) document.getElementById('propBaths').value = propDraft.baths;
+      if (propDraft.address) document.getElementById('propAddress').value = propDraft.address;
+      if (propDraft.description) document.getElementById('propDesc').value = propDraft.description;
+    }
+
+    document.getElementById('propertyForm').addEventListener('input', () => {
+      hasUnsavedFormWork = true;
+      saveDraft('propertyForm', {
+        title: document.getElementById('propTitle').value,
+        type: document.getElementById('propType').value,
+        zone: document.getElementById('propZone').value,
+        price: document.getElementById('propPrice').value,
+        size: document.getElementById('propSize').value,
+        beds: document.getElementById('propBeds').value,
+        baths: document.getElementById('propBaths').value,
+        address: document.getElementById('propAddress').value,
+        description: document.getElementById('propDesc').value
+      });
+    });
+
+    // Restaurar borrador de reporte
+    const reportDraft = loadDraft('reportForm');
+    if (reportDraft) {
+      if (reportDraft.reason) document.getElementById('reportReason').value = reportDraft.reason;
+      if (reportDraft.details) document.getElementById('reportDetails').value = reportDraft.details;
+    }
+
+    document.getElementById('reportForm').addEventListener('input', () => {
+      hasUnsavedFormWork = true;
+      saveDraft('reportForm', {
+        reason: document.getElementById('reportReason').value,
+        details: document.getElementById('reportDetails').value
+      });
+    });
+
+    // Avisar al usuario si intenta recargar/cerrar con cambios sin guardar
+    window.addEventListener('beforeunload', (e) => {
+      if (hasUnsavedFormWork) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+
+    // Detectar cambios de conexión a internet para mapa/imágenes externas
+    window.addEventListener('offline', () => {
+      showToast('Sin conexión a internet: el mapa o fotos externas pueden tardar o no cargar.');
+    });
+    window.addEventListener('online', () => {
+      showToast('Conexión a internet restablecida.');
+      if (mapInstance) mapInstance.invalidateSize();
+      renderCatalogAndMap();
+    });
+  }
+
+  /* ========================================================================
+     4. AUTENTICACIÓN Y GESTIÓN DE SESIÓN
   ======================================================================== */
   function setupAuthEvents() {
     const tabLogin = document.getElementById('tabLogin');
@@ -296,80 +499,132 @@
       loginForm.classList.remove('active');
     });
 
-    // Inicio de sesión
     loginForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const email = document.getElementById('loginEmail').value.trim().toLowerCase();
-      const password = document.getElementById('loginPassword').value;
-      const errorEl = document.getElementById('loginError');
-      errorEl.textContent = '';
+      const submitBtn = loginForm.querySelector('button[type="submit"]');
+      await runWithSubmitLock('loginSubmit', submitBtn, async () => {
+        const errorEl = document.getElementById('loginError');
+        errorEl.textContent = '';
 
-      if (!email || !password) {
-        errorEl.textContent = 'Completa tu correo y contraseña.';
-        return;
-      }
+        const emailCheck = validateTextField(document.getElementById('loginEmail').value, {
+          label: 'Correo electrónico',
+          maxLen: LIMITS.EMAIL_MAX
+        });
+        if (!emailCheck.ok) {
+          errorEl.textContent = emailCheck.error;
+          return;
+        }
+        const email = emailCheck.value.toLowerCase();
+        if (!isValidEmail(email)) {
+          errorEl.textContent = 'Ingresa un correo electrónico con formato válido.';
+          return;
+        }
 
-      const users = readStore(STORAGE_KEYS.USERS);
-      const passwordHash = await hashPassword(password);
-      const user = users.find((u) => u.email === email && u.passwordHash === passwordHash);
+        const passCheck = validateTextField(document.getElementById('loginPassword').value, {
+          label: 'Contraseña',
+          maxLen: LIMITS.PASSWORD_MAX
+        });
+        if (!passCheck.ok) {
+          errorEl.textContent = passCheck.error;
+          return;
+        }
 
-      if (!user) {
-        errorEl.textContent = 'Credenciales incorrectas. Verifica tu correo o contraseña.';
-        return;
-      }
+        const users = readStore(STORAGE_KEYS.USERS, []);
+        const passwordHash = await hashPassword(passCheck.value);
+        const user = users.find((u) => u.email === email && u.passwordHash === passwordHash);
 
-      if (!user.active) {
-        errorEl.textContent = 'Esta cuenta fue suspendida por un administrador.';
-        return;
-      }
+        if (!user) {
+          errorEl.textContent = 'Credenciales incorrectas. Verifica tu correo o contraseña.';
+          return;
+        }
 
-      startUserSession(user);
+        if (!user.active) {
+          errorEl.textContent = 'Esta cuenta fue suspendida por un administrador.';
+          return;
+        }
+
+        startUserSession(user);
+      });
     });
 
-    // Registro de usuario (Comprador o Vendedor)
     registerForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const role = document.querySelector('input[name="registerRole"]:checked').value;
-      const name = document.getElementById('regName').value.trim();
-      const email = document.getElementById('regEmail').value.trim().toLowerCase();
-      const phone = document.getElementById('regPhone').value.trim();
-      const password = document.getElementById('regPassword').value;
-      const errorEl = document.getElementById('registerError');
-      errorEl.textContent = '';
+      const submitBtn = registerForm.querySelector('button[type="submit"]');
+      await runWithSubmitLock('registerSubmit', submitBtn, async () => {
+        const errorEl = document.getElementById('registerError');
+        errorEl.textContent = '';
 
-      if (!name || !email || !phone || password.length < 6) {
-        errorEl.textContent = 'Completa todos los campos (contraseña mínima de 6 caracteres).';
-        return;
-      }
+        const roleInput = document.querySelector('input[name="registerRole"]:checked');
+        const role = roleInput && ['comprador', 'vendedor'].includes(roleInput.value) ? roleInput.value : 'comprador';
 
-      const users = readStore(STORAGE_KEYS.USERS);
-      if (users.some((u) => u.email === email)) {
-        errorEl.textContent = 'Este correo ya está registrado.';
-        return;
-      }
+        const nameCheck = validateTextField(document.getElementById('regName').value, {
+          label: 'Nombre completo',
+          minLen: 2,
+          maxLen: LIMITS.NAME_MAX
+        });
+        if (!nameCheck.ok) {
+          errorEl.textContent = nameCheck.error;
+          return;
+        }
 
-      const newUser = {
-        id: 'usr_' + Date.now(),
-        name,
-        email,
-        phone,
-        role,
-        passwordHash: await hashPassword(password),
-        favorites: [],
-        active: true
-      };
+        const emailCheck = validateTextField(document.getElementById('regEmail').value, {
+          label: 'Correo electrónico',
+          maxLen: LIMITS.EMAIL_MAX
+        });
+        if (!emailCheck.ok || !isValidEmail(emailCheck.value.toLowerCase())) {
+          errorEl.textContent = emailCheck.ok ? 'Ingresa un correo electrónico válido.' : emailCheck.error;
+          return;
+        }
+        const email = emailCheck.value.toLowerCase();
 
-      users.push(newUser);
-      writeStore(STORAGE_KEYS.USERS, users);
-      showToast(`¡Bienvenido ${name}! Cuenta creada como ${role}.`);
-      startUserSession(newUser);
+        const phoneCheck = validateTextField(document.getElementById('regPhone').value, {
+          label: 'Teléfono',
+          minLen: 7,
+          maxLen: LIMITS.PHONE_MAX
+        });
+        if (!phoneCheck.ok || !/^[0-9+\-\s()]{7,}$/.test(phoneCheck.value)) {
+          errorEl.textContent = phoneCheck.ok ? 'Ingresa un teléfono válido (solo dígitos y símbolos).' : phoneCheck.error;
+          return;
+        }
+
+        const passRaw = document.getElementById('regPassword').value;
+        if (!passRaw || passRaw.trim().length < LIMITS.PASSWORD_MIN) {
+          errorEl.textContent = `La contraseña debe tener al menos ${LIMITS.PASSWORD_MIN} caracteres sin espacios vacíos.`;
+          return;
+        }
+        if (passRaw.length > LIMITS.PASSWORD_MAX) {
+          errorEl.textContent = `La contraseña no puede superar ${LIMITS.PASSWORD_MAX} caracteres.`;
+          return;
+        }
+
+        const users = readStore(STORAGE_KEYS.USERS, []);
+        if (users.some((u) => u.email === email)) {
+          errorEl.textContent = 'Este correo ya está registrado.';
+          return;
+        }
+
+        const newUser = {
+          id: 'usr_' + Date.now(),
+          name: nameCheck.value,
+          email,
+          phone: phoneCheck.value,
+          role,
+          passwordHash: await hashPassword(passRaw),
+          favorites: [],
+          active: true
+        };
+
+        users.push(newUser);
+        writeStore(STORAGE_KEYS.USERS, users);
+        showToast(`¡Bienvenido ${newUser.name}! Cuenta creada como ${role}.`);
+        startUserSession(newUser);
+      });
     });
 
-    // Accesos rápidos de demostración
     document.querySelectorAll('[data-demo-role]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const targetRole = btn.getAttribute('data-demo-role');
-        const users = readStore(STORAGE_KEYS.USERS);
+        const users = readStore(STORAGE_KEYS.USERS, []);
         const demoUser = users.find((u) => u.role === targetRole);
         if (demoUser) {
           startUserSession(demoUser);
@@ -377,10 +632,10 @@
       });
     });
 
-    // Cerrar sesión
     document.getElementById('logoutBtn').addEventListener('click', () => {
       localStorage.removeItem(STORAGE_KEYS.SESSION);
       currentUser = null;
+      hasUnsavedFormWork = false;
       document.getElementById('appView').classList.add('hidden');
       document.getElementById('authView').classList.remove('hidden');
       showToast('Sesión cerrada correctamente.');
@@ -394,12 +649,10 @@
     document.getElementById('authView').classList.add('hidden');
     document.getElementById('appView').classList.remove('hidden');
 
-    // Actualizar datos del usuario en navbar
     document.getElementById('userNameDisplay').textContent = user.name;
     document.getElementById('userRoleBadge').textContent = user.role;
     document.getElementById('userAvatar').textContent = user.name.charAt(0).toUpperCase();
 
-    // Mostrar pestañas según el rol
     const navSellerBtn = document.getElementById('navSellerBtn');
     const navAdminBtn = document.getElementById('navAdminBtn');
 
@@ -412,7 +665,7 @@
   }
 
   /* ========================================================================
-     4. NAVEGACIÓN ENTRE SECCIONES Y VISTAS
+     5. NAVEGACIÓN ENTRE SECCIONES Y VISTAS
   ======================================================================== */
   function setupNavigationEvents() {
     document.querySelectorAll('.nav-btn[data-section]').forEach((btn) => {
@@ -421,7 +674,6 @@
       });
     });
 
-    // Botones de vista dividida / catálogo / mapa
     const layout = document.getElementById('exploreLayout');
     const catalogCol = document.getElementById('catalogColumn');
     const mapCol = document.getElementById('mapColumn');
@@ -449,7 +701,6 @@
       setTimeout(() => mapInstance && mapInstance.invalidateSize(), 150);
     });
 
-    // Cierre de modales
     document.querySelectorAll('[data-close-modal]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const modalId = btn.getAttribute('data-close-modal');
@@ -477,27 +728,35 @@
   }
 
   /* ========================================================================
-     5. FILTROS, CATÁLOGO Y FAVORITOS (COMPRADOR)
+     6. FILTROS, CATÁLOGO Y FAVORITOS (COMPRADOR)
   ======================================================================== */
   function getFilteredProperties() {
-    const allProps = readStore(STORAGE_KEYS.PROPERTIES).filter((p) => p.status === 'activa');
+    const allProps = readStore(STORAGE_KEYS.PROPERTIES, []).filter((p) => p.status === 'activa');
     const zone = document.getElementById('filterZone').value;
     const type = document.getElementById('filterType').value;
-    const maxPrice = parseFloat(document.getElementById('filterMaxPrice').value);
-    const minSize = parseFloat(document.getElementById('filterMinSize').value);
+
+    const rawMaxPrice = document.getElementById('filterMaxPrice').value.trim();
+    const rawMinSize = document.getElementById('filterMinSize').value.trim();
+
+    const maxPriceNum = rawMaxPrice !== '' && Number(rawMaxPrice) > 0 ? Number(rawMaxPrice) : null;
+    const minSizeNum = rawMinSize !== '' && Number(rawMinSize) > 0 ? Number(rawMinSize) : null;
 
     return allProps.filter((prop) => {
       if (zone !== 'todas' && prop.zone !== zone) return false;
       if (type !== 'todos' && prop.type !== type) return false;
-      if (!isNaN(maxPrice) && maxPrice > 0 && prop.price > maxPrice) return false;
-      if (!isNaN(minSize) && minSize > 0 && prop.size < minSize) return false;
+      if (maxPriceNum !== null && prop.price > maxPriceNum) return false;
+      if (minSizeNum !== null && prop.size < minSizeNum) return false;
       return true;
     });
   }
 
   function setupFilterEvents() {
     ['filterZone', 'filterType', 'filterMaxPrice', 'filterMinSize'].forEach((id) => {
-      document.getElementById(id).addEventListener('input', () => {
+      document.getElementById(id).addEventListener('input', (e) => {
+        // Evita números negativos en filtros
+        if ((id === 'filterMaxPrice' || id === 'filterMinSize') && Number(e.target.value) < 0) {
+          e.target.value = '';
+        }
         renderCatalogAndMap();
       });
     });
@@ -510,14 +769,13 @@
       renderCatalogAndMap();
     });
 
-    // Toggles de servicios cercanos en el mapa
     ['toggleSchools', 'toggleHospitals', 'toggleMarkets'].forEach((id) => {
       document.getElementById(id).addEventListener('change', renderNearbyServicesOnMap);
     });
   }
 
   function buildPropertyCardHTML(prop) {
-    const isFav = currentUser && currentUser.favorites && currentUser.favorites.includes(prop.id);
+    const isFav = currentUser && Array.isArray(currentUser.favorites) && currentUser.favorites.includes(prop.id);
     const specsText =
       prop.type === 'Terreno'
         ? `📐 ${prop.size} m² • Zona ${sanitize(prop.zone)}`
@@ -526,7 +784,7 @@
     return `
       <article class="property-card">
         <div class="property-img-wrap">
-          <img src="${sanitize(prop.image)}" alt="${sanitize(prop.title)}" loading="lazy" />
+          <img src="${sanitize(prop.image || FALLBACK_IMAGE)}" alt="${sanitize(prop.title)}" loading="lazy" onerror="window.__handleImgError(this)" />
           <span class="prop-type-badge">${sanitize(prop.type)}</span>
           <button type="button" class="fav-btn ${isFav ? 'active' : ''}" data-fav-id="${prop.id}" title="Guardar en favoritos">
             ${isFav ? '♥' : '♡'}
@@ -546,13 +804,20 @@
     `;
   }
 
+  window.__handleImgError = function (imgEl) {
+    if (imgEl && !imgEl.dataset.fallbackApplied) {
+      imgEl.dataset.fallbackApplied = '1';
+      imgEl.src = FALLBACK_IMAGE;
+    }
+  };
+
   function renderCatalogAndMap() {
     const filtered = getFilteredProperties();
     const grid = document.getElementById('propertiesGrid');
     document.getElementById('resultsCounter').textContent = `Mostrando ${filtered.length} propiedad(es) disponible(s)`;
 
     if (filtered.length === 0) {
-      grid.innerHTML = `<p>No se encontraron propiedades con los filtros seleccionados.</p>`;
+      grid.innerHTML = `<p>No se encontraron propiedades que coincidan con tu búsqueda o filtros.</p>`;
     } else {
       grid.innerHTML = filtered.map(buildPropertyCardHTML).join('');
     }
@@ -563,24 +828,25 @@
 
   function renderFavoritesSection() {
     if (!currentUser) return;
-    const allProps = readStore(STORAGE_KEYS.PROPERTIES);
-    const favProps = allProps.filter((p) => currentUser.favorites.includes(p.id));
+    const allProps = readStore(STORAGE_KEYS.PROPERTIES, []);
+    const favList = Array.isArray(currentUser.favorites) ? currentUser.favorites : [];
+    const favProps = allProps.filter((p) => favList.includes(p.id));
     document.getElementById('favCountBadge').textContent = favProps.length;
 
     const favGrid = document.getElementById('favoritesGrid');
     if (favProps.length === 0) {
-      favGrid.innerHTML = `<p>Aún no has marcado propiedades como favoritas. Haz clic en el corazón (♡) de cualquier anuncio.</p>`;
+      favGrid.innerHTML = `<p>Aún no tienes propiedades favoritas. Haz clic en el corazón (♡) de cualquier anuncio.</p>`;
     } else {
       favGrid.innerHTML = favProps.map(buildPropertyCardHTML).join('');
     }
   }
 
   function toggleFavorite(propertyId) {
-    const users = readStore(STORAGE_KEYS.USERS);
+    const users = readStore(STORAGE_KEYS.USERS, []);
     const idx = users.findIndex((u) => u.id === currentUser.id);
     if (idx === -1) return;
 
-    const favs = users[idx].favorites || [];
+    const favs = Array.isArray(users[idx].favorites) ? users[idx].favorites : [];
     if (favs.includes(propertyId)) {
       users[idx].favorites = favs.filter((id) => id !== propertyId);
       showToast('Eliminada de favoritos.');
@@ -595,20 +861,38 @@
   }
 
   /* ========================================================================
-     6. MAPA INTERACTIVO (LEAFLET.JS) Y CERCANÍA A SERVICIOS
+     7. MAPA INTERACTIVO (LEAFLET.JS) Y CERCANÍA A SERVICIOS
   ======================================================================== */
   function initMapIfNeeded() {
-    if (mapInstance || typeof L === 'undefined') return;
+    if (mapInstance) return;
+    if (typeof L === 'undefined') {
+      const mapEl = document.getElementById('propertyMap');
+      if (mapEl) {
+        mapEl.innerHTML =
+          '<div style="padding:20px;color:#475569;">El servicio de mapas no está disponible en este momento (verifica tu conexión o bloqueadores).</div>';
+      }
+      return;
+    }
 
-    mapInstance = L.map('propertyMap').setView([31.8667, -116.645], 12);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(mapInstance);
+    try {
+      mapInstance = L.map('propertyMap').setView([31.8667, -116.645], 12);
+      const tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      });
+      tileLayer.on('tileerror', () => {
+        if (!navigator.onLine) {
+          showToast('Sin conexión para cargar mosaicos del mapa.');
+        }
+      });
+      tileLayer.addTo(mapInstance);
 
-    propertyMarkersLayer = L.layerGroup().addTo(mapInstance);
-    poiMarkersLayer = L.layerGroup().addTo(mapInstance);
+      propertyMarkersLayer = L.layerGroup().addTo(mapInstance);
+      poiMarkersLayer = L.layerGroup().addTo(mapInstance);
 
-    renderNearbyServicesOnMap();
+      renderNearbyServicesOnMap();
+    } catch {
+      showToast('No fue posible inicializar el mapa interactivo.');
+    }
   }
 
   function renderPropertiesOnMap(properties) {
@@ -616,6 +900,7 @@
     propertyMarkersLayer.clearLayers();
 
     properties.forEach((prop) => {
+      if (!Number.isFinite(prop.lat) || !Number.isFinite(prop.lng)) return;
       const marker = L.marker([prop.lat, prop.lng]);
       marker.bindPopup(`
         <div style="min-width:190px;">
@@ -664,7 +949,6 @@
   }
 
   function calculateNearestServices(lat, lng) {
-    // Distancia aproximada en km (Fórmula Haversine)
     const toRad = (deg) => (deg * Math.PI) / 180;
     return NEARBY_SERVICES.map((srv) => {
       const R = 6371;
@@ -681,14 +965,13 @@
   }
 
   /* ========================================================================
-     7. DETALLE DE PROPIEDAD, CONTACTO DIRECTO Y REPORTES
+     8. DETALLE DE PROPIEDAD, CONTACTO DIRECTO Y REPORTES
   ======================================================================== */
   window.__openPropertyDetail = function (propertyId) {
-    const properties = readStore(STORAGE_KEYS.PROPERTIES);
+    const properties = readStore(STORAGE_KEYS.PROPERTIES, []);
     const prop = properties.find((p) => p.id === propertyId);
     if (!prop) return;
 
-    // Incrementar contador de visitas
     prop.views = (prop.views || 0) + 1;
     writeStore(STORAGE_KEYS.PROPERTIES, properties);
     renderSellerDashboard();
@@ -698,9 +981,11 @@
       .map((s) => `<li><strong>${sanitize(s.name)}</strong> — a ${s.distanceKm} km</li>`)
       .join('');
 
+    const favList = Array.isArray(currentUser?.favorites) ? currentUser.favorites : [];
+
     const detailContainer = document.getElementById('propertyDetailContent');
     detailContainer.innerHTML = `
-      <img src="${sanitize(prop.image)}" alt="${sanitize(prop.title)}" class="detail-hero" />
+      <img src="${sanitize(prop.image || FALLBACK_IMAGE)}" alt="${sanitize(prop.title)}" class="detail-hero" onerror="window.__handleImgError(this)" />
       <div class="detail-header">
         <div>
           <span class="status-pill status-active">${sanitize(prop.type)} • ${sanitize(prop.zone)}</span>
@@ -730,7 +1015,7 @@
         <button type="button" class="btn btn-ghost btn-sm" id="btnOpenReportModal">🚩 Denunciar anuncio</button>
         <div style="display:flex;gap:10px;">
           <button type="button" class="btn btn-secondary" id="btnDetailFav">
-            ${currentUser.favorites.includes(prop.id) ? '♥ En Favoritos' : '♡ Guardar Favorito'}
+            ${favList.includes(prop.id) ? '♥ En Favoritos' : '♡ Guardar Favorito'}
           </button>
           <button type="button" class="btn btn-primary" id="btnContactSeller">💬 Contactar al Vendedor</button>
         </div>
@@ -757,128 +1042,258 @@
   };
 
   function setupReportForm() {
-    document.getElementById('reportForm').addEventListener('submit', (e) => {
+    const reportForm = document.getElementById('reportForm');
+    reportForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const propertyId = document.getElementById('reportPropId').value;
-      const reason = document.getElementById('reportReason').value;
-      const details = document.getElementById('reportDetails').value.trim();
+      const submitBtn = reportForm.querySelector('button[type="submit"]');
+      await runWithSubmitLock('reportSubmit', submitBtn, async () => {
+        const propertyId = document.getElementById('reportPropId').value;
+        const reasonCheck = validateTextField(document.getElementById('reportReason').value, {
+          label: 'Motivo del reporte',
+          maxLen: 100
+        });
+        const detailsCheck = validateTextField(document.getElementById('reportDetails').value, {
+          label: 'Detalles adicionales',
+          minLen: 5,
+          maxLen: LIMITS.REPORT_DETAILS_MAX
+        });
 
-      const prop = readStore(STORAGE_KEYS.PROPERTIES).find((p) => p.id === propertyId);
-      if (!prop) return;
+        if (!reasonCheck.ok) {
+          showToast(reasonCheck.error);
+          return;
+        }
+        if (!detailsCheck.ok) {
+          showToast(detailsCheck.error);
+          return;
+        }
 
-      const reports = readStore(STORAGE_KEYS.REPORTS);
-      reports.unshift({
-        id: 'rep_' + Date.now(),
-        propertyId: prop.id,
-        propertyTitle: prop.title,
-        reason,
-        details,
-        reportedBy: currentUser.name,
-        status: 'pendiente'
+        const prop = readStore(STORAGE_KEYS.PROPERTIES, []).find((p) => p.id === propertyId);
+        if (!prop) {
+          showToast('La propiedad reportada ya no existe.');
+          return;
+        }
+
+        const reports = readStore(STORAGE_KEYS.REPORTS, []);
+        reports.unshift({
+          id: 'rep_' + Date.now(),
+          propertyId: prop.id,
+          propertyTitle: prop.title,
+          reason: reasonCheck.value,
+          details: detailsCheck.value,
+          reportedBy: currentUser.name,
+          status: 'pendiente'
+        });
+
+        writeStore(STORAGE_KEYS.REPORTS, reports);
+        clearDraft('reportForm');
+        hasUnsavedFormWork = false;
+        reportForm.reset();
+        document.getElementById('reportModal').classList.add('hidden');
+        showToast('Reporte enviado al panel de administración.');
+        renderAdminPanel();
       });
-
-      writeStore(STORAGE_KEYS.REPORTS, reports);
-      document.getElementById('reportForm').reset();
-      document.getElementById('reportModal').classList.add('hidden');
-      showToast('Reporte enviado al panel de administración.');
-      renderAdminPanel();
     });
   }
 
   /* ========================================================================
-     8. PANEL DEL VENDEDOR (CREAR, EDITAR, PAUSAR, ELIMINAR Y ESTADÍSTICAS)
+     9. PANEL DEL VENDEDOR (CREAR, EDITAR, PAUSAR, ELIMINAR Y ESTADÍSTICAS)
   ======================================================================== */
   function setupSellerEvents() {
+    const propForm = document.getElementById('propertyForm');
+
     document.getElementById('openNewPropertyModalBtn').addEventListener('click', () => {
       document.getElementById('propertyFormTitle').textContent = 'Publicar Nueva Propiedad';
-      document.getElementById('propertyForm').reset();
+      propForm.reset();
       document.getElementById('propId').value = '';
       document.getElementById('propFormError').textContent = '';
+      clearDraft('propertyForm');
+      hasUnsavedFormWork = false;
       document.getElementById('propertyFormModal').classList.remove('hidden');
     });
 
-    document.getElementById('propertyForm').addEventListener('submit', async (e) => {
+    propForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const errorEl = document.getElementById('propFormError');
-      errorEl.textContent = '';
+      const submitBtn = propForm.querySelector('button[type="submit"]');
+      await runWithSubmitLock('propertySubmit', submitBtn, async () => {
+        const errorEl = document.getElementById('propFormError');
+        errorEl.textContent = '';
 
-      const id = document.getElementById('propId').value;
-      const title = document.getElementById('propTitle').value.trim();
-      const type = document.getElementById('propType').value;
-      const zone = document.getElementById('propZone').value;
-      const price = parseFloat(document.getElementById('propPrice').value);
-      const size = parseFloat(document.getElementById('propSize').value);
-      const beds = parseInt(document.getElementById('propBeds').value, 10) || 0;
-      const baths = parseInt(document.getElementById('propBaths').value, 10) || 0;
-      const address = document.getElementById('propAddress').value.trim();
-      const lat = parseFloat(document.getElementById('propLat').value);
-      const lng = parseFloat(document.getElementById('propLng').value);
-      const description = document.getElementById('propDesc').value.trim();
-      const imageUrlInput = document.getElementById('propImageUrl').value.trim();
-      const fileInput = document.getElementById('propImageFile');
+        const id = document.getElementById('propId').value.trim();
+        const titleCheck = validateTextField(document.getElementById('propTitle').value, {
+          label: 'Título del anuncio',
+          minLen: 3,
+          maxLen: LIMITS.PROP_TITLE_MAX
+        });
+        if (!titleCheck.ok) {
+          errorEl.textContent = titleCheck.error;
+          return;
+        }
 
-      if (!title || !address || !description || isNaN(price) || isNaN(size) || isNaN(lat) || isNaN(lng)) {
-        errorEl.textContent = 'Por favor completa todos los campos obligatorios correctamente.';
-        return;
-      }
+        const type = document.getElementById('propType').value;
+        const zone = document.getElementById('propZone').value;
 
-      // Leer archivo local como Base64 si el vendedor subió fotografía
-      let finalImage =
-        imageUrlInput ||
-        'https://images.unsplash.com/photo-1512917774080-9991f1c4c750?auto=format&fit=crop&w=900&q=80';
+        const priceCheck = parseStrictNumber(document.getElementById('propPrice').value, {
+          min: 0,
+          max: LIMITS.MAX_PRICE,
+          allowZero: false,
+          label: 'Precio (MXN)'
+        });
+        if (!priceCheck.ok) {
+          errorEl.textContent = priceCheck.error;
+          return;
+        }
 
-      if (fileInput.files && fileInput.files[0]) {
-        finalImage = await fileToDataURL(fileInput.files[0]);
-      }
+        const sizeCheck = parseStrictNumber(document.getElementById('propSize').value, {
+          min: 0,
+          max: LIMITS.MAX_SIZE,
+          allowZero: false,
+          label: 'Superficie (m²)'
+        });
+        if (!sizeCheck.ok) {
+          errorEl.textContent = sizeCheck.error;
+          return;
+        }
 
-      const properties = readStore(STORAGE_KEYS.PROPERTIES);
+        const bedsCheck = parseStrictNumber(document.getElementById('propBeds').value, {
+          min: 0,
+          max: LIMITS.MAX_ROOMS,
+          allowZero: true,
+          label: 'Recámaras'
+        });
+        if (!bedsCheck.ok) {
+          errorEl.textContent = bedsCheck.error;
+          return;
+        }
 
-      if (id) {
-        const index = properties.findIndex((p) => p.id === id);
-        if (index !== -1) {
-          properties[index] = {
-            ...properties[index],
-            title,
+        const bathsCheck = parseStrictNumber(document.getElementById('propBaths').value, {
+          min: 0,
+          max: LIMITS.MAX_ROOMS,
+          allowZero: true,
+          label: 'Baños'
+        });
+        if (!bathsCheck.ok) {
+          errorEl.textContent = bathsCheck.error;
+          return;
+        }
+
+        const addressCheck = validateTextField(document.getElementById('propAddress').value, {
+          label: 'Dirección o referencia',
+          minLen: 4,
+          maxLen: LIMITS.PROP_ADDRESS_MAX
+        });
+        if (!addressCheck.ok) {
+          errorEl.textContent = addressCheck.error;
+          return;
+        }
+
+        const latCheck = parseStrictNumber(document.getElementById('propLat').value, {
+          min: -90,
+          max: 90,
+          allowZero: true,
+          label: 'Latitud'
+        });
+        if (!latCheck.ok) {
+          errorEl.textContent = latCheck.error;
+          return;
+        }
+
+        const lngCheck = parseStrictNumber(document.getElementById('propLng').value, {
+          min: -180,
+          max: 180,
+          allowZero: true,
+          label: 'Longitud'
+        });
+        if (!lngCheck.ok) {
+          errorEl.textContent = lngCheck.error;
+          return;
+        }
+
+        const descCheck = validateTextField(document.getElementById('propDesc').value, {
+          label: 'Descripción detallada',
+          minLen: 10,
+          maxLen: LIMITS.PROP_DESC_MAX
+        });
+        if (!descCheck.ok) {
+          errorEl.textContent = descCheck.error;
+          return;
+        }
+
+        const imageUrlInput = document.getElementById('propImageUrl').value.trim();
+        const fileInput = document.getElementById('propImageFile');
+
+        if (imageUrlInput && !isSafeHttpUrl(imageUrlInput)) {
+          errorEl.textContent = 'La URL de la imagen debe comenzar con http:// o https://.';
+          return;
+        }
+
+        if (fileInput.files && fileInput.files[0]) {
+          const file = fileInput.files[0];
+          if (!file.type.startsWith('image/')) {
+            errorEl.textContent = 'El archivo seleccionado debe ser una imagen válida.';
+            return;
+          }
+          if (file.size > 3 * 1024 * 1024) {
+            errorEl.textContent = 'La imagen no debe superar 3 MB.';
+            return;
+          }
+        }
+
+        let finalImage = imageUrlInput || FALLBACK_IMAGE;
+        if (fileInput.files && fileInput.files[0]) {
+          finalImage = await fileToDataURL(fileInput.files[0]);
+        }
+
+        const properties = readStore(STORAGE_KEYS.PROPERTIES, []);
+
+        if (id) {
+          const index = properties.findIndex((p) => p.id === id);
+          if (index !== -1) {
+            properties[index] = {
+              ...properties[index],
+              title: titleCheck.value,
+              type,
+              zone,
+              price: priceCheck.value,
+              size: sizeCheck.value,
+              beds: Math.trunc(bedsCheck.value),
+              baths: Math.trunc(bathsCheck.value),
+              address: addressCheck.value,
+              lat: latCheck.value,
+              lng: lngCheck.value,
+              image: fileInput.files[0] || imageUrlInput ? finalImage : properties[index].image,
+              description: descCheck.value
+            };
+            showToast('Publicación actualizada correctamente.');
+          }
+        } else {
+          properties.unshift({
+            id: 'prop_' + Date.now(),
+            sellerId: currentUser.id,
+            sellerName: currentUser.name,
+            title: titleCheck.value,
             type,
             zone,
-            price,
-            size,
-            beds,
-            baths,
-            address,
-            lat,
-            lng,
-            image: fileInput.files[0] || imageUrlInput ? finalImage : properties[index].image,
-            description
-          };
-          showToast('Publicación actualizada correctamente.');
+            price: priceCheck.value,
+            size: sizeCheck.value,
+            beds: Math.trunc(bedsCheck.value),
+            baths: Math.trunc(bathsCheck.value),
+            address: addressCheck.value,
+            lat: latCheck.value,
+            lng: lngCheck.value,
+            image: finalImage,
+            description: descCheck.value,
+            views: 1,
+            status: 'activa'
+          });
+          showToast('¡Propiedad publicada con éxito!');
         }
-      } else {
-        properties.unshift({
-          id: 'prop_' + Date.now(),
-          sellerId: currentUser.id,
-          sellerName: currentUser.name,
-          title,
-          type,
-          zone,
-          price,
-          size,
-          beds,
-          baths,
-          address,
-          lat,
-          lng,
-          image: finalImage,
-          description,
-          views: 1,
-          status: 'activa'
-        });
-        showToast('¡Propiedad publicada con éxito!');
-      }
 
-      writeStore(STORAGE_KEYS.PROPERTIES, properties);
-      document.getElementById('propertyFormModal').classList.add('hidden');
-      refreshAllUI();
+        writeStore(STORAGE_KEYS.PROPERTIES, properties);
+        clearDraft('propertyForm');
+        hasUnsavedFormWork = false;
+        document.getElementById('propertyFormModal').classList.add('hidden');
+        refreshAllUI();
+      });
     });
   }
 
@@ -886,27 +1301,27 @@
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
+      reader.onerror = () => reject(new Error('Error al leer la imagen'));
       reader.readAsDataURL(file);
     });
   }
 
   function renderSellerDashboard() {
     if (!currentUser) return;
-    const allProps = readStore(STORAGE_KEYS.PROPERTIES);
+    const allProps = readStore(STORAGE_KEYS.PROPERTIES, []);
     const myProps =
       currentUser.role === 'admin'
         ? allProps
         : allProps.filter((p) => p.sellerId === currentUser.id);
 
-    const allUsers = readStore(STORAGE_KEYS.USERS);
+    const allUsers = readStore(STORAGE_KEYS.USERS, []);
     const myPropIds = myProps.map((p) => p.id);
     const totalFavs = allUsers.reduce((acc, u) => {
-      const count = (u.favorites || []).filter((fid) => myPropIds.includes(fid)).length;
-      return acc + count;
+      const favs = Array.isArray(u.favorites) ? u.favorites : [];
+      return acc + favs.filter((fid) => myPropIds.includes(fid)).length;
     }, 0);
 
-    const myChats = readStore(STORAGE_KEYS.MESSAGES).filter((c) => myPropIds.includes(c.propertyId));
+    const myChats = readStore(STORAGE_KEYS.MESSAGES, []).filter((c) => myPropIds.includes(c.propertyId));
 
     document.getElementById('statTotalProps').textContent = myProps.length;
     document.getElementById('statTotalViews').textContent = myProps.reduce((sum, p) => sum + (p.views || 0), 0);
@@ -946,7 +1361,7 @@
   }
 
   /* ========================================================================
-     9. CHAT INTERNO COMPRADOR - VENDEDOR
+     10. CHAT INTERNO COMPRADOR - VENDEDOR
   ======================================================================== */
   function setupChatEvents() {
     const drawer = document.getElementById('chatDrawer');
@@ -959,34 +1374,45 @@
       drawer.classList.add('hidden');
     });
 
-    document.getElementById('chatSendForm').addEventListener('submit', (e) => {
+    const chatForm = document.getElementById('chatSendForm');
+    chatForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!activeChatThreadId) return;
-      const input = document.getElementById('chatMessageInput');
-      const text = input.value.trim();
-      if (!text) return;
+      const submitBtn = chatForm.querySelector('button[type="submit"]');
+      await runWithSubmitLock('chatSend', submitBtn, async () => {
+        const input = document.getElementById('chatMessageInput');
+        const msgCheck = validateTextField(input.value, {
+          label: 'Mensaje',
+          minLen: 1,
+          maxLen: LIMITS.CHAT_MSG_MAX
+        });
+        if (!msgCheck.ok) {
+          showToast(msgCheck.error);
+          return;
+        }
 
-      const threads = readStore(STORAGE_KEYS.MESSAGES);
-      const thread = threads.find((t) => t.id === activeChatThreadId);
-      if (!thread) return;
+        const threads = readStore(STORAGE_KEYS.MESSAGES, []);
+        const thread = threads.find((t) => t.id === activeChatThreadId);
+        if (!thread) return;
 
-      const now = new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' });
-      thread.messages.push({
-        senderId: currentUser.id,
-        senderName: currentUser.name,
-        text,
-        timestamp: now
+        const now = new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' });
+        thread.messages.push({
+          senderId: currentUser.id,
+          senderName: currentUser.name,
+          text: msgCheck.value,
+          timestamp: now
+        });
+
+        writeStore(STORAGE_KEYS.MESSAGES, threads);
+        input.value = '';
+        renderChatThreads();
+        renderActiveChatMessages();
       });
-
-      writeStore(STORAGE_KEYS.MESSAGES, threads);
-      input.value = '';
-      renderChatThreads();
-      renderActiveChatMessages();
     });
   }
 
   function startOrOpenChat(property) {
-    const threads = readStore(STORAGE_KEYS.MESSAGES);
+    const threads = readStore(STORAGE_KEYS.MESSAGES, []);
     const threadId = `chat_${property.id}_${currentUser.id}`;
     let thread = threads.find((t) => t.id === threadId);
 
@@ -1020,7 +1446,7 @@
 
   function getUserThreads() {
     if (!currentUser) return [];
-    const threads = readStore(STORAGE_KEYS.MESSAGES);
+    const threads = readStore(STORAGE_KEYS.MESSAGES, []);
     if (currentUser.role === 'admin') return threads;
     return threads.filter((t) => t.buyerId === currentUser.id || t.sellerId === currentUser.id);
   }
@@ -1035,7 +1461,7 @@
       return;
     }
 
-    if (!activeChatThreadId) {
+    if (!activeChatThreadId || !threads.some((t) => t.id === activeChatThreadId)) {
       activeChatThreadId = threads[0].id;
     }
 
@@ -1063,6 +1489,7 @@
 
     if (!thread) {
       headerEl.textContent = 'Selecciona una conversación';
+      containerEl.innerHTML = `<p class="empty-hint">Selecciona un chat o inicia uno desde el detalle de una propiedad.</p>`;
       formEl.classList.add('hidden');
       return;
     }
@@ -1086,10 +1513,10 @@
   }
 
   /* ========================================================================
-     10. PANEL DE ADMINISTRACIÓN (REPORTES Y USUARIOS)
+     11. PANEL DE ADMINISTRACIÓN (REPORTES Y USUARIOS)
   ======================================================================== */
   function renderAdminPanel() {
-    const reports = readStore(STORAGE_KEYS.REPORTS);
+    const reports = readStore(STORAGE_KEYS.REPORTS, []);
     const pendingCount = reports.filter((r) => r.status === 'pendiente').length;
     document.getElementById('reportCountBadge').textContent = pendingCount;
 
@@ -1123,8 +1550,13 @@
         .join('');
     }
 
-    const users = readStore(STORAGE_KEYS.USERS);
+    const users = readStore(STORAGE_KEYS.USERS, []);
     const usersTbody = document.getElementById('adminUsersTable');
+    if (users.length === 0) {
+      usersTbody.innerHTML = `<tr><td colspan="5">No hay usuarios registrados.</td></tr>`;
+      return;
+    }
+
     usersTbody.innerHTML = users
       .map(
         (u) => `
@@ -1153,28 +1585,25 @@
   }
 
   /* ========================================================================
-     11. DELEGACIÓN GLOBAL DE EVENTOS DINÁMICOS
+     12. DELEGACIÓN GLOBAL DE EVENTOS DINÁMICOS
   ======================================================================== */
   function setupDelegatedActions() {
     document.body.addEventListener('click', (e) => {
-      // Favoritos
       const favBtn = e.target.closest('[data-fav-id]');
       if (favBtn) {
         toggleFavorite(favBtn.getAttribute('data-fav-id'));
         return;
       }
 
-      // Detalle de propiedad
       const detailBtn = e.target.closest('[data-detail-id]');
       if (detailBtn) {
         window.__openPropertyDetail(detailBtn.getAttribute('data-detail-id'));
         return;
       }
 
-      // Centrar propiedad en el mapa
       const mapBtn = e.target.closest('[data-focus-map-id]');
       if (mapBtn && mapInstance) {
-        const prop = readStore(STORAGE_KEYS.PROPERTIES).find(
+        const prop = readStore(STORAGE_KEYS.PROPERTIES, []).find(
           (p) => p.id === mapBtn.getAttribute('data-focus-map-id')
         );
         if (prop) {
@@ -1184,10 +1613,9 @@
         return;
       }
 
-      // Vendedor: Editar propiedad
       const editBtn = e.target.closest('[data-edit-prop]');
       if (editBtn) {
-        const prop = readStore(STORAGE_KEYS.PROPERTIES).find(
+        const prop = readStore(STORAGE_KEYS.PROPERTIES, []).find(
           (p) => p.id === editBtn.getAttribute('data-edit-prop')
         );
         if (prop) {
@@ -1203,17 +1631,16 @@
           document.getElementById('propAddress').value = prop.address;
           document.getElementById('propLat').value = prop.lat;
           document.getElementById('propLng').value = prop.lng;
-          document.getElementById('propImageUrl').value = prop.image.startsWith('http') ? prop.image : '';
+          document.getElementById('propImageUrl').value = prop.image && prop.image.startsWith('http') ? prop.image : '';
           document.getElementById('propDesc').value = prop.description;
           document.getElementById('propertyFormModal').classList.remove('hidden');
         }
         return;
       }
 
-      // Vendedor: Pausar / Activar propiedad
       const togglePropBtn = e.target.closest('[data-toggle-prop]');
       if (togglePropBtn) {
-        const props = readStore(STORAGE_KEYS.PROPERTIES);
+        const props = readStore(STORAGE_KEYS.PROPERTIES, []);
         const prop = props.find((p) => p.id === togglePropBtn.getAttribute('data-toggle-prop'));
         if (prop) {
           prop.status = prop.status === 'activa' ? 'pausada' : 'activa';
@@ -1224,18 +1651,16 @@
         return;
       }
 
-      // Vendedor: Eliminar propiedad
       const deletePropBtn = e.target.closest('[data-delete-prop]');
       if (deletePropBtn) {
         const targetId = deletePropBtn.getAttribute('data-delete-prop');
-        const props = readStore(STORAGE_KEYS.PROPERTIES).filter((p) => p.id !== targetId);
+        const props = readStore(STORAGE_KEYS.PROPERTIES, []).filter((p) => p.id !== targetId);
         writeStore(STORAGE_KEYS.PROPERTIES, props);
         showToast('Publicación eliminada.');
         refreshAllUI();
         return;
       }
 
-      // Chat: Seleccionar hilo
       const threadItem = e.target.closest('[data-thread-id]');
       if (threadItem) {
         activeChatThreadId = threadItem.getAttribute('data-thread-id');
@@ -1243,10 +1668,9 @@
         return;
       }
 
-      // Admin: Descartar reporte
       const resolveRepBtn = e.target.closest('[data-resolve-report]');
       if (resolveRepBtn) {
-        const reports = readStore(STORAGE_KEYS.REPORTS);
+        const reports = readStore(STORAGE_KEYS.REPORTS, []);
         const rep = reports.find((r) => r.id === resolveRepBtn.getAttribute('data-resolve-report'));
         if (rep) {
           rep.status = 'resuelto';
@@ -1257,15 +1681,14 @@
         return;
       }
 
-      // Admin: Eliminar anuncio reportado
       const removeReportedBtn = e.target.closest('[data-remove-reported-prop]');
       if (removeReportedBtn) {
-        const reports = readStore(STORAGE_KEYS.REPORTS);
+        const reports = readStore(STORAGE_KEYS.REPORTS, []);
         const rep = reports.find((r) => r.id === removeReportedBtn.getAttribute('data-remove-reported-prop'));
         if (rep) {
           rep.status = 'resuelto';
           writeStore(STORAGE_KEYS.REPORTS, reports);
-          const props = readStore(STORAGE_KEYS.PROPERTIES).filter((p) => p.id !== rep.propertyId);
+          const props = readStore(STORAGE_KEYS.PROPERTIES, []).filter((p) => p.id !== rep.propertyId);
           writeStore(STORAGE_KEYS.PROPERTIES, props);
           showToast('Anuncio eliminado y reporte resuelto.');
           refreshAllUI();
@@ -1273,10 +1696,9 @@
         return;
       }
 
-      // Admin: Suspender / Reactivar usuario
       const toggleUserBtn = e.target.closest('[data-toggle-user]');
       if (toggleUserBtn) {
-        const users = readStore(STORAGE_KEYS.USERS);
+        const users = readStore(STORAGE_KEYS.USERS, []);
         const user = users.find((u) => u.id === toggleUserBtn.getAttribute('data-toggle-user'));
         if (user) {
           user.active = !user.active;
@@ -1296,7 +1718,7 @@
   }
 
   /* ========================================================================
-     12. INICIALIZACIÓN DE LA APLICACIÓN
+     13. INICIALIZACIÓN DE LA APLICACIÓN
   ======================================================================== */
   document.addEventListener('DOMContentLoaded', async () => {
     await seedDatabaseIfEmpty();
@@ -1307,12 +1729,12 @@
     setupSellerEvents();
     setupChatEvents();
     setupReportForm();
+    setupDraftAndReloadProtection();
     setupDelegatedActions();
 
-    // Restaurar sesión activa si existe
     const savedSessionId = localStorage.getItem(STORAGE_KEYS.SESSION);
     if (savedSessionId) {
-      const user = readStore(STORAGE_KEYS.USERS).find((u) => u.id === savedSessionId && u.active);
+      const user = readStore(STORAGE_KEYS.USERS, []).find((u) => u.id === savedSessionId && u.active);
       if (user) {
         startUserSession(user);
       }
